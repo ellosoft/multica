@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
+	"github.com/multica-ai/multica/server/internal/daemon/sandbox"
 	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
@@ -144,6 +146,9 @@ type Daemon struct {
 	// New() and overridable in tests so the auto-update poller can be exercised
 	// without touching the real network or the brew CLI.
 	runUpdateFn func(targetVersion string) (string, error)
+
+	sandboxMgr     *sandbox.Manager // nil when docker is unavailable; gates sandbox mode
+	sandboxIdleTTL time.Duration    // reap idle issue containers after this
 }
 
 // New creates a new Daemon instance.
@@ -171,6 +176,11 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	}
 	d.runner = taskRunnerFunc(d.runTask)
 	d.runUpdateFn = d.runUpdate
+	if _, err := exec.LookPath("docker"); err == nil {
+		d.sandboxMgr = sandbox.NewManager(sandbox.NewDockerClient())
+		d.sandboxIdleTTL = 4 * time.Hour
+		d.logger.Info("sandbox: docker detected, per-issue sandbox available")
+	}
 	return d
 }
 
@@ -633,6 +643,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.serveHealth(ctx, healthLn, time.Now())
+	if d.sandboxMgr != nil {
+		go d.sandboxMgr.ReapLoop(ctx, 10*time.Minute, d.sandboxIdleTTL)
+	}
 	d.logger.Debug("background loops launched (workspace-sync, task-wakeup, heartbeat, gc, auto-update, health)")
 	err = d.pollLoop(ctx, taskWakeups)
 	d.logger.Debug("daemon main loop returning", "error", err)
@@ -2201,6 +2214,12 @@ func providerNeedsInlineSystemPrompt(provider string) bool {
 	}
 }
 
+// shellQuote wraps s in single quotes, escaping any embedded single quotes,
+// so it is safe to interpolate into a POSIX /bin/sh command line.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (TaskResult, error) {
 	// Refuse to spawn an agent without a workspace. An empty workspace_id
 	// here would make MULTICA_WORKSPACE_ID empty in the agent env, and the
@@ -2399,8 +2418,40 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			agentEnv[k] = v
 		}
 	}
+	execPathForAgent := entry.Path
+	if d.sandboxMgr != nil && task.ProjectID != "" {
+		sc, scErr := d.client.GetProjectSandboxConfig(ctx, task.ProjectID)
+		if scErr != nil {
+			d.logger.Warn("sandbox: config fetch failed, falling back to host execution", "err", scErr, "task", task.ID)
+		} else if sc != nil && sc.Enabled {
+			cfg := sandbox.Config{Enabled: true, Image: sc.Image, SetupCommand: sc.SetupCommand, CPUs: sc.CPUs, Memory: sc.Memory}
+			selfPath, _ := os.Executable()
+			mounts := []sandbox.Mount{
+				{HostPath: d.cfg.WorkspacesRoot, ContainerPath: d.cfg.WorkspacesRoot},
+				{HostPath: filepath.Dir(entry.Path), ContainerPath: filepath.Dir(entry.Path), ReadOnly: true},
+				{HostPath: filepath.Dir(selfPath), ContainerPath: filepath.Dir(selfPath), ReadOnly: true},
+				{HostPath: os.TempDir(), ContainerPath: os.TempDir(), ReadOnly: true},
+			}
+			cid, ensErr := d.sandboxMgr.EnsureSandbox(ctx, task.IssueID, cfg, mounts)
+			if ensErr != nil {
+				return TaskResult{}, fmt.Errorf("sandbox ensure for issue %s: %w", task.IssueID, ensErr)
+			}
+			if cid != "" {
+				d.sandboxMgr.Touch(task.IssueID)
+				// Wrapper lives OUTSIDE the git worktree (in the env root, parent of WorkDir)
+				// so it never pollutes the repo. It is executed on the host and docker-execs in.
+				shimPath := filepath.Join(filepath.Dir(env.WorkDir), "agent-shim.sh")
+				script := "#!/bin/sh\nexec " + shellQuote(selfPath) + " __sandbox-exec --container " + shellQuote(cid) + " --exec " + shellQuote(entry.Path) + " -- \"$@\"\n"
+				if werr := os.WriteFile(shimPath, []byte(script), 0o755); werr != nil {
+					return TaskResult{}, fmt.Errorf("sandbox write shim: %w", werr)
+				}
+				execPathForAgent = shimPath
+				d.logger.Info("sandbox: routing agent into container", "issue", task.IssueID, "container", cid)
+			}
+		}
+	}
 	backend, err := agent.New(provider, agent.Config{
-		ExecutablePath: entry.Path,
+		ExecutablePath: execPathForAgent,
 		Env:            agentEnv,
 		Logger:         d.logger,
 	})
