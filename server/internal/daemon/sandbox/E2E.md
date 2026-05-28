@@ -29,7 +29,7 @@ file. Expected last line: `PASS: shim executed the command inside the container 
 ## B. Full end-to-end (live stack)
 
 ### Prerequisites
-- Multica **server** with migration **108** applied (runs on startup) and a **daemon**
+- Multica **server** with migration **111** applied (runs on startup) and a **daemon**
   on a host with Docker.
 - A base **`sandbox_image`** that provides the agent's **runtime dependencies** (e.g.
   `node` for `claude`). The agent binary *and* the `multica` CLI are **not** baked into
