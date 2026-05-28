@@ -406,6 +406,24 @@ type WorkspaceReposResponse struct {
 	Settings     json.RawMessage `json:"settings,omitempty"`
 }
 
+// SandboxConfig is the resolved per-issue sandbox config the server returns.
+type SandboxConfig struct {
+	Enabled      bool   `json:"enabled"`
+	Image        string `json:"image"`
+	SetupCommand string `json:"setup_command"`
+	CPUs         string `json:"cpus"`
+	Memory       string `json:"memory"`
+}
+
+// GetProjectSandboxConfig fetches the resolved sandbox config for a project.
+func (c *Client) GetProjectSandboxConfig(ctx context.Context, projectID string) (*SandboxConfig, error) {
+	var resp SandboxConfig
+	if err := c.getJSON(ctx, fmt.Sprintf("/api/daemon/projects/%s/sandbox-config", projectID), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 func (c *Client) GetWorkspaceRepos(ctx context.Context, workspaceID string) (*WorkspaceReposResponse, error) {
 	var resp WorkspaceReposResponse
 	if err := c.getJSON(ctx, fmt.Sprintf("/api/daemon/workspaces/%s/repos", workspaceID), &resp); err != nil {
