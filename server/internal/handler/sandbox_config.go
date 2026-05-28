@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -103,4 +104,84 @@ func (h *Handler) GetProjectSandboxConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, resolveSandbox(project, global))
+}
+
+// sandboxConfigInput is the write payload for both project and global sandbox
+// config endpoints.
+type sandboxConfigInput struct {
+	Enabled      bool   `json:"enabled"`
+	Image        string `json:"image"`
+	SetupCommand string `json:"setup_command"`
+	CPUs         string `json:"cpus"`
+	Memory       string `json:"memory"`
+}
+
+// UpsertProjectSandboxConfig sets the sandbox config for one project. It is
+// registered under the user-auth'd /api/projects/{id} group.
+func (h *Handler) UpsertProjectSandboxConfig(w http.ResponseWriter, r *http.Request) {
+	projectID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "project id")
+	if !ok {
+		return
+	}
+	var in sandboxConfigInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	_, err := h.DB.Exec(r.Context(),
+		`INSERT INTO ellosoft_sandbox_config (project_id, enabled, image, setup_command, cpus, memory)
+		 VALUES ($1,$2,$3,$4,$5,$6)
+		 ON CONFLICT (project_id) DO UPDATE SET
+		   enabled=EXCLUDED.enabled, image=EXCLUDED.image, setup_command=EXCLUDED.setup_command,
+		   cpus=EXCLUDED.cpus, memory=EXCLUDED.memory`,
+		projectID, in.Enabled, in.Image, in.SetupCommand, in.CPUs, in.Memory)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save sandbox config")
+		return
+	}
+	writeJSON(w, http.StatusOK, SandboxConfigResponse{
+		Enabled:      in.Enabled,
+		Image:        in.Image,
+		SetupCommand: in.SetupCommand,
+		CPUs:         in.CPUs,
+		Memory:       in.Memory,
+	})
+}
+
+// UpsertGlobalSandboxConfig sets the single global-default sandbox config row.
+// It is registered under the user-auth'd group as PUT /api/sandbox-config/global.
+// The partial unique index on is_global=true makes ON CONFLICT awkward; we use
+// UPDATE-then-INSERT to handle the upsert cleanly.
+func (h *Handler) UpsertGlobalSandboxConfig(w http.ResponseWriter, r *http.Request) {
+	var in sandboxConfigInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	ctx := r.Context()
+	tag, err := h.DB.Exec(ctx,
+		`UPDATE ellosoft_sandbox_config
+		 SET enabled=$1, image=$2, setup_command=$3, cpus=$4, memory=$5
+		 WHERE is_global = true`,
+		in.Enabled, in.Image, in.SetupCommand, in.CPUs, in.Memory)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save global sandbox config")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := h.DB.Exec(ctx,
+			`INSERT INTO ellosoft_sandbox_config (project_id, enabled, image, setup_command, cpus, memory, is_global)
+			 VALUES (NULL,$1,$2,$3,$4,$5,true)`,
+			in.Enabled, in.Image, in.SetupCommand, in.CPUs, in.Memory); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create global sandbox config")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, SandboxConfigResponse{
+		Enabled:      in.Enabled,
+		Image:        in.Image,
+		SetupCommand: in.SetupCommand,
+		CPUs:         in.CPUs,
+		Memory:       in.Memory,
+	})
 }

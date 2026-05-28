@@ -452,8 +452,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/resources", h.ListProjectResources)
 					r.Post("/resources", h.CreateProjectResource)
 					r.Delete("/resources/{resourceId}", h.DeleteProjectResource)
+					r.Put("/sandbox-config", h.UpsertProjectSandboxConfig)
 				})
 			})
+
+			// Sandbox config — global default (workspace-wide fallback)
+			r.Put("/api/sandbox-config/global", h.UpsertGlobalSandboxConfig)
 
 			// Squads
 			r.Route("/api/squads", func(r chi.Router) {

@@ -14,6 +14,20 @@ Tracks insertion points for Ellosoft-specific changes in the Multica fork.
 
 - In `EnsureSandbox`, in the `RunSpec{...}` passed to `m.docker.Run`, added `AddHosts: []string{"host.docker.internal:host-gateway"}` so the in-container agent can reach the host daemon over the docker default bridge. Network left empty.
 
+## server/cmd/server/router.go (Task 6a — admin write endpoints)
+
+- Inside the `r.Route("/{id}", ...)` sub-block of `r.Route("/api/projects", ...)`, added:
+  ```go
+  r.Put("/sandbox-config", h.UpsertProjectSandboxConfig)
+  ```
+  This is protected by the enclosing user-auth middleware (same auth as all other `/api/projects/{id}` routes).
+
+- Immediately before the `r.Route("/api/squads", ...)` block (still inside the user-auth'd group), added:
+  ```go
+  r.Put("/api/sandbox-config/global", h.UpsertGlobalSandboxConfig)
+  ```
+  No separate admin-only group exists at the flat `/api` level; this sits under the same user-auth middleware. A workspace-role gate can be added later if needed.
+
 ## server/internal/daemon/daemon.go (per-issue sandbox launch, flag-guarded)
 
 - Imports: added `"os/exec"` and `"github.com/multica-ai/multica/server/internal/daemon/sandbox"`.
