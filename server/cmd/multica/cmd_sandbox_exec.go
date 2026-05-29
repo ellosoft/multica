@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -21,6 +22,31 @@ func rewriteLoopbackEnv(env []string, gateway string) []string {
 		out[i] = val
 	}
 	return out
+}
+
+// sanitizeEnvForContainer drops the host PATH (which points at the daemon host's
+// dirs — e.g. /opt/homebrew/bin on a macOS dev box — that don't exist in a Linux
+// container) and substitutes a deterministic container PATH. The agent and
+// multica binaries are mirror-mounted read-only at identical absolute paths, so
+// their dirs are placed first, followed by the standard container search path.
+func sanitizeEnvForContainer(env []string, realExec, selfPath string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if key, _, ok := strings.Cut(kv, "="); ok && key == "PATH" {
+			continue // replaced below
+		}
+		out = append(out, kv)
+	}
+	dirs := []string{}
+	seen := map[string]bool{}
+	for _, d := range []string{filepath.Dir(selfPath), filepath.Dir(realExec)} {
+		if d != "" && d != "." && !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+	dirs = append(dirs, "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+	return append(out, "PATH="+strings.Join(dirs, ":"))
 }
 
 // buildDockerExecArgs builds the `docker exec` argv (no TTY):
@@ -81,7 +107,11 @@ func init() {
 
 func runSandboxExec(cobraCmd *cobra.Command, args []string) error {
 	cwd, _ := os.Getwd()
-	env := rewriteLoopbackEnv(os.Environ(), "host.docker.internal")
+	selfPath, _ := os.Executable()
+	env := sanitizeEnvForContainer(
+		rewriteLoopbackEnv(os.Environ(), "host.docker.internal"),
+		sandboxExecBin, selfPath,
+	)
 
 	dockerArgs := buildDockerExecArgs(sandboxExecContainer, cwd, env, sandboxExecBin, args)
 	child := exec.Command("docker", dockerArgs...)
@@ -93,20 +123,15 @@ func runSandboxExec(cobraCmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
-	// Install signal handler: forward SIGINT/SIGTERM to child and run pkill
-	// backstop so the specific agent process (identified by MULTICA_TASK_ID)
-	// is cleaned up inside the container.
+	// Forward catchable termination signals to the docker exec client. The
+	// authoritative cleanup of the in-container agent process is performed by
+	// the daemon (sandbox.Manager.KillTaskProcess) after the task ends: when the
+	// daemon cancels a task it kills this shim with SIGKILL, which cannot be
+	// trapped here, so we do not rely on a signal handler for cleanup.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		for sig := range sigCh {
-			// Best-effort pkill backstop inside the container.
-			taskID := os.Getenv("MULTICA_TASK_ID")
-			if taskID != "" {
-				pkill := exec.Command("docker", "exec", sandboxExecContainer, "sh", "-c", "pkill -TERM -f "+taskID)
-				_ = pkill.Run()
-			}
-			// Forward the signal to the docker exec child process.
 			if child.Process != nil {
 				_ = child.Process.Signal(sig)
 			}
@@ -116,13 +141,6 @@ func runSandboxExec(cobraCmd *cobra.Command, args []string) error {
 	runErr := child.Wait()
 	signal.Stop(sigCh)
 	close(sigCh)
-
-	// Also run a cleanup pkill on normal exit so orphans don't linger.
-	taskID := os.Getenv("MULTICA_TASK_ID")
-	if taskID != "" && runErr != nil {
-		pkill := exec.Command("docker", "exec", sandboxExecContainer, "sh", "-c", "pkill -TERM -f "+taskID)
-		_ = pkill.Run()
-	}
 
 	os.Exit(exitCodeOf(runErr))
 	return nil // unreachable; satisfies RunE signature

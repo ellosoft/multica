@@ -644,6 +644,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.autoUpdateLoop(ctx)
 	go d.serveHealth(ctx, healthLn, time.Now())
 	if d.sandboxMgr != nil {
+		// Adopt any sandbox containers that survived a daemon restart so the
+		// reaper governs them (otherwise they'd be reused but never reaped).
+		d.sandboxMgr.Adopt(ctx)
 		go d.sandboxMgr.ReapLoop(ctx, 10*time.Minute, d.sandboxIdleTTL)
 	}
 	d.logger.Debug("background loops launched (workspace-sync, task-wakeup, heartbeat, gc, auto-update, health)")
@@ -2430,7 +2433,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				{HostPath: d.cfg.WorkspacesRoot, ContainerPath: d.cfg.WorkspacesRoot},
 				{HostPath: filepath.Dir(entry.Path), ContainerPath: filepath.Dir(entry.Path), ReadOnly: true},
 				{HostPath: filepath.Dir(selfPath), ContainerPath: filepath.Dir(selfPath), ReadOnly: true},
-				{HostPath: os.TempDir(), ContainerPath: os.TempDir(), ReadOnly: true},
+				// Temp is read-write: the host writes the MCP config here (read by the
+				// in-container agent via --mcp-config), and the agent may itself write
+				// temp files into the same root once inside the container.
+				{HostPath: os.TempDir(), ContainerPath: os.TempDir()},
 			}
 			cid, ensErr := d.sandboxMgr.EnsureSandbox(ctx, task.IssueID, cfg, mounts)
 			if ensErr != nil {
@@ -2438,6 +2444,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			}
 			if cid != "" {
 				d.sandboxMgr.Touch(task.IssueID)
+				// Mark the task in-flight so the reaper won't remove this shared
+				// container while the agent is running (even past the idle TTL), and
+				// guarantee cleanup of the in-container agent process from the daemon:
+				// on cancellation the shim is SIGKILLed and cannot clean up itself.
+				d.sandboxMgr.TaskStarted(task.IssueID)
+				defer func() {
+					_ = d.sandboxMgr.KillTaskProcess(context.Background(), cid, task.ID)
+					d.sandboxMgr.TaskFinished(task.IssueID)
+				}()
 				// Wrapper lives OUTSIDE the git worktree (in the env root, parent of WorkDir)
 				// so it never pollutes the repo. It is executed on the host and docker-execs in.
 				shimPath := filepath.Join(filepath.Dir(env.WorkDir), "agent-shim.sh")

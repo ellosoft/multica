@@ -25,6 +25,7 @@ type Manager struct {
 	mu       sync.Mutex
 	locks    map[string]*sync.Mutex
 	lastUsed map[string]time.Time
+	active   map[string]int // count of in-flight tasks per issue; reaper skips issues with active > 0
 }
 
 // NewManager returns a Manager backed by the given DockerClient.
@@ -33,6 +34,7 @@ func NewManager(d DockerClient) *Manager {
 		docker:   d,
 		locks:    map[string]*sync.Mutex{},
 		lastUsed: map[string]time.Time{},
+		active:   map[string]int{},
 	}
 }
 
@@ -72,6 +74,12 @@ func (m *Manager) EnsureSandbox(ctx context.Context, issueID string, cfg Config,
 		m.touch(issueID, time.Now())
 		return ids[0], nil
 	}
+
+	// No running container. A stopped/exited leftover with the same name (e.g.
+	// from a crash, or a daemon restart that lost its in-memory state) is invisible
+	// to Inspect's running-only filter but still makes `docker run --name` fail with
+	// a name conflict. Force-remove it by name first (no-op if absent).
+	_ = m.docker.Remove(ctx, containerName(issueID))
 
 	id, err := m.docker.Run(ctx, RunSpec{
 		Name:       containerName(issueID),

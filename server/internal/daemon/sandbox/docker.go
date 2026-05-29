@@ -49,7 +49,10 @@ type DockerClient interface {
 	RunInside(ctx context.Context, containerID string, argv ...string) (string, error)
 	// Inspect returns container IDs that match the given label filter (e.g. "multica.issue=ISSUE1").
 	Inspect(ctx context.Context, label string) ([]string, error)
-	// Remove force-removes a container.
+	// ListIssues returns the issue ids of all sandbox containers (running or not),
+	// read from the multica.issue label. Used to adopt survivors after a restart.
+	ListIssues(ctx context.Context) ([]string, error)
+	// Remove force-removes a container by id or name (best-effort).
 	Remove(ctx context.Context, containerID string) error
 }
 
@@ -156,6 +159,23 @@ func (c *cliDocker) Inspect(ctx context.Context, label string) ([]string, error)
 		}
 	}
 	return ids, nil
+}
+
+// ListIssues implements DockerClient. It lists all sandbox containers (including
+// stopped ones) and returns the value of their multica.issue label.
+func (c *cliDocker) ListIssues(ctx context.Context) ([]string, error) {
+	out, err := c.run(ctx, "ps", "-a", "--filter", "label="+issueLabel,
+		"--format", "{{index .Labels \""+issueLabel+"\"}}")
+	if err != nil {
+		return nil, err
+	}
+	var issues []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			issues = append(issues, line)
+		}
+	}
+	return issues, nil
 }
 
 // Remove implements DockerClient.

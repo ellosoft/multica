@@ -102,10 +102,26 @@ Dispatch a task → it runs **on the host** exactly as before, and **no** contai
   `MULTICA_SERVER_URL` is left as-is (it must be a network-reachable address).
 - **`exec: <agent>: not found` in the container:** the agent binary is mirror-mounted, but
   its runtime deps aren't — make sure the base image (or `setup_command`) provides them.
+- **A tool the agent spawns isn't found, though it's in the image:** PATH inside the container
+  is deterministic (mirror-mounted agent + multica dirs, then `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
+  the daemon host's PATH is intentionally **not** forwarded. If a tool lives elsewhere, install
+  it onto a standard path via `setup_command`.
+- **Cancelled task left a process running in the container:** cancellation is handled by the
+  daemon (`Manager.KillTaskProcess`), which kills the in-container process whose environment
+  contains `MULTICA_TASK_ID=<task>` (via a `/proc/*/environ` scan — `pkill -f` can't match it,
+  the id is env-only). The base image needs a POSIX `sh` with `grep`/`tr`/`basename` (busybox is fine).
 - **Empty mounts / files missing inside the container (macOS):** the shared-path caveat above.
 - **No container created though enabled:** check the daemon host actually has `docker` on
   PATH (the manager is nil otherwise → silent host fallback) and that the task's issue has a
   `project_id`.
+
+## Reliability notes
+- **Long tasks aren't reaped mid-run:** the reaper skips any issue with an in-flight task
+  (`TaskStarted`/`TaskFinished`), so a task running longer than the idle TTL keeps its container.
+- **Restart survivors:** on startup the daemon `Adopt`s existing `multica.issue` containers so
+  they're governed by the reaper rather than leaking.
+- **Stale same-name container:** `EnsureSandbox` force-removes a leftover `multica-sbx-<issue>`
+  by name before `docker run`, so an exited container from a prior crash/restart can't wedge creation.
 
 ## Known follow-ups (not blockers)
 - Idle TTL is a constant (`4h`) in `daemon.New` — expose as an env/config knob if you want
