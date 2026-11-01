@@ -20,7 +20,7 @@ catalog:
 
   # Runtime schema validation (defensive boundary against API drift —
   # see CLAUDE.md "API Response Compatibility")
-  zod: "^4.1.5"
+  zod: "^4.6.6"
 
   # UI & Styling
   tailwindcss: "^4"
